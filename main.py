@@ -1,27 +1,38 @@
 import os
-import httpx
 import json
 import re
+import dspy
+import litellm
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+# Configure litellm to be more lenient
+litellm.drop_params = True
 
 app = FastAPI()
 
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://api.openai.com/v1/chat/completions")
 
-TOOL_INSTRUCTION = """
-You have access to the following tools. To call a tool, respond with a JSON object inside <tool_call> tags.
-Format: <tool_call>{"name": "tool_name", "arguments": {"arg1": "value1"}}</tool_call>
+class ChatCompletionSignature(dspy.Signature):
+    """
+    You are a helpful assistant. You may have access to tools.
+    If tools are available, call them using the specified format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    """
+    messages = dspy.InputField(desc="The list of messages in the conversation.")
+    tools = dspy.InputField(desc="The list of available tools.")
+    response_content = dspy.OutputField(desc="The assistant's response, potentially including tool calls.")
 
-Tools:
-%s
-"""
+class ChatProxy(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.predictor = dspy.Predict(ChatCompletionSignature)
+
+    def forward(self, messages, tools=None):
+        return self.predictor(messages=messages, tools=tools)
 
 def extract_tool_calls(text):
-    """
-    Extracts tool calls from the model's text response.
-    Expects format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    """
     pattern = r"<tool_call>(.*?)</tool_call>"
     matches = re.findall(pattern, text, re.DOTALL)
     tool_calls = []
@@ -43,63 +54,57 @@ def extract_tool_calls(text):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
 
-    tools = body.pop("tools", None)
-    tool_choice = body.pop("tool_choice", None)
+    model_name = body.get("model", "gpt-3.5-turbo")
+    messages = body.get("messages", [])
+    tools = body.get("tools")
 
-    if tools:
-        # Inject tool definitions into the system prompt
-        tools_str = json.dumps(tools, indent=2)
-        instruction = TOOL_INSTRUCTION % tools_str
+    api_base = UPSTREAM_URL.replace("/chat/completions", "")
 
-        messages = body.get("messages", [])
-        system_msg_index = -1
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                system_msg_index = i
-                break
+    dspy_model_name = model_name
+    if not ("/" in dspy_model_name):
+        dspy_model_name = f"openai/{dspy_model_name}"
 
-        if system_msg_index != -1:
-            messages[system_msg_index]["content"] += "\n" + instruction
-        else:
-            messages.insert(0, {"role": "system", "content": instruction})
+    lm = dspy.LM(model=dspy_model_name, api_key=api_key, api_base=api_base)
 
-        body["messages"] = messages
+    with dspy.context(lm=lm):
+        proxy = ChatProxy()
 
-    async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
-                UPSTREAM_URL,
-                json=body,
-                headers=headers,
-                timeout=60.0
-            )
-
-            if response.status_code != 200:
-                return JSONResponse(content=response.json(), status_code=response.status_code)
-
-            resp_json = response.json()
-
-            # If we had tools, try to parse tool calls from the response
-            if tools and "choices" in resp_json:
-                for choice in resp_json["choices"]:
-                    message = choice.get("message", {})
-                    content = message.get("content", "")
-                    if content:
-                        tool_calls = extract_tool_calls(content)
-                        if tool_calls:
-                            message["tool_calls"] = tool_calls
-                            # Optional: remove the raw <tool_call> from content
-                            message["content"] = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL).strip()
-                            # If content is empty after stripping, OpenAI usually expects it to be null or an empty string
-                            if not message["content"]:
-                                message["content"] = None
-                            choice["finish_reason"] = "tool_calls"
-
-            return JSONResponse(content=resp_json, status_code=response.status_code)
+            # Pass messages as list of dicts directly if possible, or structured
+            # For now, let's stick to a simple representation that works with Predict
+            prediction = proxy(messages=str(messages), tools=json.dumps(tools) if tools else "None")
+            response_text = prediction.response_content
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            if hasattr(e, 'lm_response'):
+                 response_text = e.lm_response
+            else:
+                 raise HTTPException(status_code=500, detail=str(e))
+
+        tool_calls = extract_tool_calls(response_text)
+
+        message = {"role": "assistant", "content": response_text}
+        finish_reason = "stop"
+
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            message["content"] = re.sub(r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL).strip()
+            if not message["content"]:
+                message["content"] = None
+            finish_reason = "tool_calls"
+
+        return JSONResponse(content={
+            "id": f"chatcmpl-{os.urandom(12).hex()}",
+            "object": "chat.completion",
+            "created": 123456789,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason
+            }]
+        })
 
 if __name__ == "__main__":
     import uvicorn
