@@ -1,0 +1,3 @@
+[submodule "duckai_repo"]
+	path = duckai_repo
+	url = https://github.com/bodhi-sys/duckai.git

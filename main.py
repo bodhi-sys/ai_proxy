@@ -3,6 +3,7 @@ import json
 import re
 import dspy
 import litellm
+import time
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -72,9 +73,7 @@ async def chat_completions(request: Request):
         proxy = ChatProxy()
 
         try:
-            # Pass messages as list of dicts directly if possible, or structured
-            # For now, let's stick to a simple representation that works with Predict
-            prediction = proxy(messages=str(messages), tools=json.dumps(tools) if tools else "None")
+            prediction = proxy(messages=json.dumps(messages), tools=json.dumps(tools) if tools else "None")
             response_text = prediction.response_content
         except Exception as e:
             if hasattr(e, 'lm_response'):
@@ -97,7 +96,7 @@ async def chat_completions(request: Request):
         return JSONResponse(content={
             "id": f"chatcmpl-{os.urandom(12).hex()}",
             "object": "chat.completion",
-            "created": 123456789,
+            "created": int(time.time()),
             "model": model_name,
             "choices": [{
                 "index": 0,
