@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          duckai_repo/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('duckai_repo/Cargo.lock') }}
+
+    - name: Build DuckAI
+      run: |
+        cd duckai_repo
+        cargo build --release
+
+    - name: Run unit tests
+      run: |
+        PYTHONPATH=. pytest tests/test_proxy.py
+
+    - name: Run CI verification
+      run: |
+        PYTHONPATH=. python scripts/verify_ci.py
