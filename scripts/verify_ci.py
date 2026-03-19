@@ -13,8 +13,6 @@ PROXY_PORT = 8000
 DUCKAI_PORT = 8080
 
 def setup_duckai():
-    # In a real CI, duckai should be already there if not using external network
-    # For this sandbox, we expect the user to have provided it or it's not possible to clone
     if not os.path.exists(DUCKAI_DIR):
         print(f"Error: {DUCKAI_DIR} not found. In CI, please ensure DuckAI is available.")
         sys.exit(1)
@@ -41,6 +39,65 @@ def stop_process(process):
         except Exception as e:
             pass
 
+def test_chat_completion(model="gpt-5-mini"):
+    print(f"Testing chat completion with model {model}...")
+    url = f"http://localhost:{PROXY_PORT}/v1/chat/completions"
+    headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Hello, who are you?"}]
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=60)
+    print(f"Chat status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        print(f"Received content: {content}")
+        return bool(content)
+    else:
+        print(f"Error: {response.text}")
+        return False
+
+def test_tool_call(model="gpt-5-mini"):
+    print(f"Testing tool call with model {model}...")
+    url = f"http://localhost:{PROXY_PORT}/v1/chat/completions"
+    headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "What is the weather in San Francisco?"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather in a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        ]
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=60)
+    print(f"Tool call status: {response.status_code}")
+    if response.status_code == 200:
+        data = response.json()
+        message = data["choices"][0]["message"]
+        if "tool_calls" in message:
+            print(f"Received tool call: {message['tool_calls'][0]['function']['name']}")
+            return True
+        else:
+            print(f"No tool call received. Response: {message.get('content')}")
+            return False
+    else:
+        print(f"Error: {response.text}")
+        return False
+
 def main():
     duckai_process = None
     proxy_process = None
@@ -60,31 +117,14 @@ def main():
         proxy_process = start_process(f"{sys.executable} -m uvicorn main:app --port {PROXY_PORT}", env=env)
         time.sleep(10)
 
-        print("Testing end-to-end integration...")
-        url = f"http://localhost:{PROXY_PORT}/v1/chat/completions"
-        headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": "Hello, who are you?"}]
-        }
+        print("Running tests...")
+        chat_ok = test_chat_completion()
+        tool_ok = test_tool_call()
 
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
-            print(f"Response status: {response.status_code}")
-
-            if response.status_code == 200:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                print(f"Received content: {content}")
-                if content:
-                    success = True
-            else:
-                print(f"Error response: {response.text}")
-        except Exception as e:
-             print(f"Request failed: {e}")
+        success = chat_ok and tool_ok
 
     except Exception as e:
-        print(f"Verification failed with error: {e}")
+        print(f"Verification failed: {e}")
     finally:
         print("Cleaning up processes...")
         stop_process(proxy_process)
