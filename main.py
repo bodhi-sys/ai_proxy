@@ -6,9 +6,9 @@ import litellm
 import time
 import logging
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, AsyncGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -57,12 +57,68 @@ def extract_tool_calls(text):
             continue
     return tool_calls
 
+async def stream_generator(response_text, model_name):
+    chat_id = f"chatcmpl-{os.urandom(12).hex()}"
+    created = int(time.time())
+
+    tool_calls = extract_tool_calls(response_text)
+    content = response_text
+
+    if tool_calls:
+        content = re.sub(r"<tool_call>.*?</tool_call>", "", response_text, flags=re.DOTALL).strip()
+        if not content:
+            content = None
+
+        chunk = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+
+    if content:
+        chunk = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": content
+                },
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+
+    chunk = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls" if tool_calls else "stop"
+        }]
+    }
+    yield f"data: {json.dumps(chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     headers = dict(request.headers)
 
-    # Debug log for incoming request
     logger.debug(f"Incoming Request Body: {json.dumps(body, indent=2)}")
     logger.debug(f"Incoming Request Headers: {json.dumps({k: v for k, v in headers.items() if k.lower() != 'authorization'}, indent=2)}")
 
@@ -71,6 +127,7 @@ async def chat_completions(request: Request):
     model_name = body.get("model", "gpt-3.5-turbo")
     messages = body.get("messages", [])
     tools = body.get("tools")
+    stream = body.get("stream", False)
 
     api_base = UPSTREAM_URL.replace("/chat/completions", "")
 
@@ -78,12 +135,19 @@ async def chat_completions(request: Request):
     if not ("/" in dspy_model_name):
         dspy_model_name = f"openai/{dspy_model_name}"
 
+    # In DSPy, we can try to use streaming if supported, but for now
+    # we collect the full response to parse tool calls correctly.
+    # To really support streaming tool calls, we'd need to parse incrementally.
+
     lm = dspy.LM(model=dspy_model_name, api_key=api_key, api_base=api_base)
 
     with dspy.context(lm=lm):
         proxy = ChatProxy()
 
         try:
+            # We explicitly pass the stream parameter to DSPy if we want it to stream internally
+            # but then we lose the ability to easily parse the tool_calls from the full response.
+            # For MVP, we'll keep the full collection.
             prediction = proxy(messages=json.dumps(messages), tools=json.dumps(tools) if tools else "None")
             response_text = prediction.response_content
         except Exception as e:
@@ -91,6 +155,13 @@ async def chat_completions(request: Request):
                  response_text = e.lm_response
             else:
                  raise HTTPException(status_code=500, detail=str(e))
+
+        if stream:
+            # IMPORTANT: For real streaming support, the response MUST be formatted as SSE
+            return StreamingResponse(
+                stream_generator(response_text, model_name),
+                media_type="text/event-stream"
+            )
 
         tool_calls = extract_tool_calls(response_text)
 

@@ -57,3 +57,29 @@ async def test_proxy_with_tool_call_parsing():
         assert json.loads(message["tool_calls"][0]["function"]["arguments"])["location"] == "San Francisco"
         assert "Let me check." in message["content"]
         assert "<tool_call>" not in message["content"]
+
+@pytest.mark.asyncio
+async def test_proxy_streaming():
+    with respx.mock as respx_mock:
+        # Use a content that won't be messed up by string representation if any
+        respx_mock.post(url__regex=r".*/chat/completions").mock(return_value=httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "Hello"}}]
+        }))
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True
+            },
+            headers={"Authorization": "Bearer test-key"}
+        )
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+        content = response.text
+        # Check for presence of the data structure
+        assert "chat.completion.chunk" in content
+        assert "Hello" in content
+        assert "data: [DONE]" in content

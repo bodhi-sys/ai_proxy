@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import shutil
+import json
 
 # Configuration
 DUCKAI_DIR = "duckai_repo"
@@ -98,6 +99,49 @@ def test_tool_call(model="gpt-5-mini"):
         print(f"Error: {response.text}")
         return False
 
+def test_streaming(model="gpt-5-mini"):
+    print(f"Testing streaming with model {model}...")
+    url = f"http://localhost:{PROXY_PORT}/v1/chat/completions"
+    headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Tell me a short story."}],
+        "stream": True
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=60)
+        print(f"Streaming status: {response.status_code}")
+        if response.status_code != 200:
+            print(f"Error: {response.text}")
+            return False
+
+        has_content = False
+        has_done = False
+        for line in response.iter_lines():
+            if line:
+                line_str = line.decode('utf-8')
+                print(f"DEBUG: stream line: {line_str}")
+                if line_str.startswith("data: "):
+                    data_str = line_str[len("data: "):]
+                    if data_str.strip() == "[DONE]":
+                        has_done = True
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                        if data["choices"][0]["delta"].get("content"):
+                            has_content = True
+                    except json.JSONDecodeError:
+                        print(f"Failed to parse JSON: {data_str}")
+
+        return has_content and has_done
+    except Exception as e:
+        print(f"Streaming test failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def main():
     duckai_process = None
     proxy_process = None
@@ -120,8 +164,9 @@ def main():
         print("Running tests...")
         chat_ok = test_chat_completion()
         tool_ok = test_tool_call()
+        stream_ok = test_streaming()
 
-        success = chat_ok and tool_ok
+        success = chat_ok and tool_ok and stream_ok
 
     except Exception as e:
         print(f"Verification failed: {e}")
