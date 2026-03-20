@@ -4,10 +4,15 @@ import re
 import dspy
 import litellm
 import time
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Configure litellm to be more lenient
 litellm.drop_params = True
@@ -55,6 +60,12 @@ def extract_tool_calls(text):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    headers = dict(request.headers)
+
+    # Debug log for incoming request
+    logger.debug(f"Incoming Request Body: {json.dumps(body, indent=2)}")
+    logger.debug(f"Incoming Request Headers: {json.dumps({k: v for k, v in headers.items() if k.lower() != 'authorization'}, indent=2)}")
+
     api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
 
     model_name = body.get("model", "gpt-3.5-turbo")
