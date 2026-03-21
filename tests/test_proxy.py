@@ -1,9 +1,11 @@
 import json
 import pytest
 from fastapi.testclient import TestClient
-from main import app
+from main import app, RateLimiter
 import unittest.mock as mock
 import dspy
+import time
+import asyncio
 
 client = TestClient(app)
 
@@ -129,3 +131,16 @@ async def test_proxy_structured_history(mock_litellm_completion):
     assert any(m["role"] == "user" and m["content"] == "Hello" for m in sent_messages)
     assert any(m["role"] == "assistant" and "tool_call" in m["content"] for m in sent_messages)
     assert any(m["role"] == "user" and "72 degrees" in m["content"] for m in sent_messages)
+
+@pytest.mark.asyncio
+async def test_rate_limiter():
+    # Set a rate limit of 60 RPM (1 second interval)
+    limiter = RateLimiter(60)
+
+    start_time = time.time()
+    await limiter.wait() # First call, no wait
+    await limiter.wait() # Second call, should wait ~1 second
+    end_time = time.time()
+
+    duration = end_time - start_time
+    assert duration >= 0.9 # Allow some margin for scheduler

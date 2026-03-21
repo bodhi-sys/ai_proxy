@@ -5,6 +5,7 @@ import dspy
 import litellm
 import time
 import logging
+import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -20,6 +21,29 @@ litellm.drop_params = True
 app = FastAPI()
 
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://api.openai.com/v1/chat/completions")
+QUERIES_PER_MINUTE = int(os.getenv("QUERIES_PER_MINUTE", "60"))
+
+class RateLimiter:
+    def __init__(self, rpm: int):
+        self.interval = 60.0 / rpm if rpm > 0 else 0
+        self.last_call = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        if self.interval == 0:
+            return
+        async with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            wait_time = self.interval - elapsed
+            if wait_time > 0:
+                logger.info(f"Rate limit reached, waiting for {wait_time:.2f} seconds...")
+                await asyncio.sleep(wait_time)
+                self.last_call = time.time()
+            else:
+                self.last_call = now
+
+rate_limiter = RateLimiter(QUERIES_PER_MINUTE)
 
 TOOL_INSTRUCTION = """
 You have access to the following tools. To call a tool, respond with a JSON object inside <tool_call> tags.
@@ -123,6 +147,8 @@ async def stream_generator(response_text, model_name):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    await rate_limiter.wait()
+
     body = await request.json()
     headers = dict(request.headers)
 
@@ -164,15 +190,10 @@ async def chat_completions(request: Request):
         proxy = ChatProxy()
 
         try:
-            # We must ensure that the messages are in the format expected by DSPy.
-            # Convert roles to strings or objects that DSPy's adapter understands.
-            # Actually, passing the list of dicts should work if the adapter is correctly configured.
             prediction = proxy(messages=messages)
             response_text = prediction.response_content
         except Exception as e:
             logger.error(f"Error in DSPy prediction: {e}")
-            import traceback
-            traceback.print_exc()
             if hasattr(e, 'lm_response'):
                  response_text = e.lm_response
             else:
