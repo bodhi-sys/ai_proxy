@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+pytest
+respx
+pytest-asyncio
+dspy-ai
+pydantic
