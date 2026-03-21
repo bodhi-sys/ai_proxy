@@ -21,13 +21,20 @@ app = FastAPI()
 
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://api.openai.com/v1/chat/completions")
 
+TOOL_INSTRUCTION = """
+You have access to the following tools. To call a tool, respond with a JSON object inside <tool_call> tags.
+Format: <tool_call>{"name": "tool_name", "arguments": {"arg1": "value1"}}</tool_call>
+
+Tools:
+%s
+"""
+
 class ChatCompletionSignature(dspy.Signature):
     """
     You are a helpful assistant. You may have access to tools.
     If tools are available, call them using the specified format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
     """
-    messages = dspy.InputField(desc="The list of messages in the conversation.")
-    tools = dspy.InputField(desc="The list of available tools.")
+    messages = dspy.InputField(desc="The list of messages in the conversation history.")
     response_content = dspy.OutputField(desc="The assistant's response, potentially including tool calls.")
 
 class ChatProxy(dspy.Module):
@@ -35,8 +42,8 @@ class ChatProxy(dspy.Module):
         super().__init__()
         self.predictor = dspy.Predict(ChatCompletionSignature)
 
-    def forward(self, messages, tools=None):
-        return self.predictor(messages=messages, tools=tools)
+    def forward(self, messages):
+        return self.predictor(messages=messages)
 
 def extract_tool_calls(text):
     pattern = r"<tool_call>(.*?)</tool_call>"
@@ -129,15 +136,27 @@ async def chat_completions(request: Request):
     tools = body.get("tools")
     stream = body.get("stream", False)
 
+    # Inject tools info into system prompt if tools are present
+    if tools:
+        tools_str = json.dumps(tools, indent=2)
+        instruction = TOOL_INSTRUCTION % tools_str
+
+        system_msg_index = -1
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                system_msg_index = i
+                break
+
+        if system_msg_index != -1:
+            messages[system_msg_index]["content"] += "\n" + instruction
+        else:
+            messages.insert(0, {"role": "system", "content": instruction})
+
     api_base = UPSTREAM_URL.replace("/chat/completions", "")
 
     dspy_model_name = model_name
     if not ("/" in dspy_model_name):
         dspy_model_name = f"openai/{dspy_model_name}"
-
-    # In DSPy, we can try to use streaming if supported, but for now
-    # we collect the full response to parse tool calls correctly.
-    # To really support streaming tool calls, we'd need to parse incrementally.
 
     lm = dspy.LM(model=dspy_model_name, api_key=api_key, api_base=api_base)
 
@@ -145,19 +164,21 @@ async def chat_completions(request: Request):
         proxy = ChatProxy()
 
         try:
-            # We explicitly pass the stream parameter to DSPy if we want it to stream internally
-            # but then we lose the ability to easily parse the tool_calls from the full response.
-            # For MVP, we'll keep the full collection.
-            prediction = proxy(messages=json.dumps(messages), tools=json.dumps(tools) if tools else "None")
+            # We must ensure that the messages are in the format expected by DSPy.
+            # Convert roles to strings or objects that DSPy's adapter understands.
+            # Actually, passing the list of dicts should work if the adapter is correctly configured.
+            prediction = proxy(messages=messages)
             response_text = prediction.response_content
         except Exception as e:
+            logger.error(f"Error in DSPy prediction: {e}")
+            import traceback
+            traceback.print_exc()
             if hasattr(e, 'lm_response'):
                  response_text = e.lm_response
             else:
                  raise HTTPException(status_code=500, detail=str(e))
 
         if stream:
-            # IMPORTANT: For real streaming support, the response MUST be formatted as SSE
             return StreamingResponse(
                 stream_generator(response_text, model_name),
                 media_type="text/event-stream"
